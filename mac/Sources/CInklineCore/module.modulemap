@@ -1,0 +1,4 @@
+module CInklineCore {
+    header "inkline.h"
+    export *
+}

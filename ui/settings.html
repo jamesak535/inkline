@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<!--
+  Inkline settings UI — SHARED across platforms.
+
+  This single file is the entire settings interface; each platform's shell just
+  hosts it in a WebView (macOS: WKWebView, Windows: WebView2) and implements the
+  message bridge. Don't fork this per platform — the only platform-specific line
+  is the `send()` transport shim below.
+
+  Protocol (must match each shell's bridge):
+    JS  -> native :  send({type})
+        ready                                  request current state + models
+        setEnabled        {value: bool}
+        setSuppressSecure {value: bool}
+        setAppEnabled     {bundleId, value: bool}
+        selectModel       {path}               make a model active
+        downloadModel     {url}                download a .gguf into the models dir
+        cancelDownload                         cancel the active download
+        chooseModelsFolder                     open a folder picker for the models dir
+    native -> JS  :
+        window.inklineSetState({ enabled, suppressSecure, apps: [{bundleId, name, enabled}] })
+        window.inklineSetModels({ dir, models: [{name, path, size, active}] })
+        window.inklineDownloadProgress({ name?, received?, total?, done, error?, cancelled? })
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; accent-color: #3b82f6; }
+  html, body { background: Canvas; color: CanvasText; }
+  body { font: 13px -apple-system, system-ui, "Segoe UI", sans-serif; margin: 0; padding: 22px; }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { color: gray; margin: 0 0 18px; font-size: 12px; }
+  .row { display: flex; align-items: center; justify-content: space-between;
+         gap: 16px; padding: 11px 0; border-top: 1px solid color-mix(in srgb, CanvasText 14%, transparent); }
+  .label { display: flex; flex-direction: column; }
+  .hint { color: gray; font-size: 11px; margin-top: 2px; }
+  .section { font-weight: 600; margin: 24px 0 4px; }
+  .apps { margin-top: 8px; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+          border-radius: 8px; max-height: 300px; overflow-y: auto; }
+  .app { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+         padding: 9px 14px; border-top: 1px solid color-mix(in srgb, CanvasText 9%, transparent); }
+  .app:first-child { border-top: none; }
+  .app .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: gray; padding: 14px; }
+  input[type=checkbox] { width: 15px; height: 15px; flex: none; }
+  .meta { color: gray; font-size: 11px; margin-top: 2px; }
+  .active-badge { color: #16a34a; font-size: 11px; font-weight: 600; }
+  button { font: inherit; padding: 4px 12px; border-radius: 6px;
+           border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
+           background: color-mix(in srgb, CanvasText 6%, transparent); color: CanvasText; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .dl-row { display: flex; gap: 8px; margin-top: 12px; }
+  .dl-row input[type=text] { flex: 1; font: inherit; padding: 6px 10px; border-radius: 6px;
+           border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+           background: Field; color: FieldText; }
+  #dlProgress { margin-top: 12px; display: none; }
+  #dlBar { width: 100%; height: 6px; }
+  .catalog { margin-top: 10px; font-size: 12px; }
+  .catalog a { color: #3b82f6; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+  <h1>Inkline</h1>
+  <p class="sub">On-device predictive text. Nothing you type leaves your machine.</p>
+
+  <div class="row">
+    <div class="label"><span>Enable Inkline</span>
+      <span class="hint">Show inline suggestions while you type.</span></div>
+    <input type="checkbox" id="enabled">
+  </div>
+  <div class="row">
+    <div class="label"><span>Skip password fields</span>
+      <span class="hint">Never read or suggest in secure text fields.</span></div>
+    <input type="checkbox" id="suppressSecure">
+  </div>
+
+  <div class="section">Models</div>
+  <span class="hint">The active model runs all suggestions, on-device.</span>
+  <div class="apps" id="models"><div class="empty">Loading…</div></div>
+
+  <div class="row">
+    <div class="label"><span>Models folder</span>
+      <span class="hint" id="modelsDir" style="word-break: break-all;">…</span></div>
+    <button id="chooseDirBtn">Choose…</button>
+  </div>
+
+  <div class="dl-row">
+    <input type="text" id="modelUrl" placeholder="Paste a .gguf download URL">
+    <button id="dlBtn">Download</button>
+  </div>
+  <div class="catalog">Find GGUF models on Hugging Face (filter by the GGUF tag), then paste a file's download URL above.</div>
+  <div id="dlProgress">
+    <div class="hint" id="dlLabel"></div>
+    <progress id="dlBar" max="100" value="0"></progress>
+    <div style="margin-top: 8px;"><button id="cancelBtn">Cancel</button></div>
+  </div>
+
+  <div class="section">Per-app</div>
+  <span class="hint">Uncheck an app to turn Inkline off while it's focused.</span>
+  <div class="apps" id="apps"><div class="empty">Loading…</div></div>
+
+<script>
+  // The one platform-specific line: pick whichever WebView bridge is present.
+  function send(msg) {
+    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.inkline) {
+      window.webkit.messageHandlers.inkline.postMessage(msg);        // macOS WKWebView
+    } else if (window.chrome && window.chrome.webview) {
+      window.chrome.webview.postMessage(msg);                        // Windows WebView2
+    }
+  }
+
+  function fmtBytes(n) {
+    if (!n || n <= 0) return '';
+    var u = ['B', 'KB', 'MB', 'GB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+  }
+
+  document.getElementById('enabled').addEventListener('change', function (e) {
+    send({ type: 'setEnabled', value: e.target.checked });
+  });
+  document.getElementById('suppressSecure').addEventListener('change', function (e) {
+    send({ type: 'setSuppressSecure', value: e.target.checked });
+  });
+
+  document.getElementById('dlBtn').addEventListener('click', function () {
+    var url = document.getElementById('modelUrl').value.trim();
+    if (!url) return;
+    send({ type: 'downloadModel', url: url });
+    setDownloading(true);
+    showProgress('Starting…', null);
+  });
+
+  document.getElementById('cancelBtn').addEventListener('click', function () {
+    send({ type: 'cancelDownload' });
+  });
+
+  document.getElementById('chooseDirBtn').addEventListener('click', function () {
+    send({ type: 'chooseModelsFolder' });
+  });
+
+  function setDownloading(on) {
+    document.getElementById('dlBtn').disabled = on;
+    document.getElementById('dlProgress').style.display = on ? 'block' : 'none';
+  }
+
+  function showProgress(label, pct) {
+    document.getElementById('dlProgress').style.display = 'block';
+    document.getElementById('dlLabel').textContent = label;
+    var bar = document.getElementById('dlBar');
+    if (pct == null) { bar.removeAttribute('value'); } else { bar.value = pct; }
+  }
+
+  // native -> JS: installed models list + current folder.
+  window.inklineSetModels = function (state) {
+    if (state.dir) document.getElementById('modelsDir').textContent = state.dir;
+    var box = document.getElementById('models');
+    box.innerHTML = '';
+    if (!state.models || state.models.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No models installed — download one below.';
+      box.appendChild(empty);
+      return;
+    }
+    state.models.forEach(function (m) {
+      var row = document.createElement('div');
+      row.className = 'app';
+      var left = document.createElement('div');
+      var name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = m.name;
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = fmtBytes(m.size);
+      left.appendChild(name);
+      left.appendChild(meta);
+      row.appendChild(left);
+      if (m.active) {
+        var badge = document.createElement('span');
+        badge.className = 'active-badge';
+        badge.textContent = 'Active';
+        row.appendChild(badge);
+      } else {
+        var use = document.createElement('button');
+        use.textContent = 'Use';
+        use.addEventListener('click', function () { send({ type: 'selectModel', path: m.path }); });
+        row.appendChild(use);
+      }
+      box.appendChild(row);
+    });
+  };
+
+  // native -> JS: download progress + completion.
+  window.inklineDownloadProgress = function (p) {
+    if (p.done) {
+      document.getElementById('dlBtn').disabled = false;
+      if (p.cancelled) {
+        document.getElementById('dlProgress').style.display = 'none';
+      } else if (p.error) {
+        showProgress('Download failed: ' + p.error, 0);
+      } else {
+        showProgress('Installed ' + (p.name || 'model') + '.', 100);
+        document.getElementById('modelUrl').value = '';
+        setTimeout(function () { document.getElementById('dlProgress').style.display = 'none'; }, 2500);
+      }
+      return;
+    }
+    setDownloading(true);
+    var label = (p.name || 'Downloading') + ' — ' + fmtBytes(p.received) +
+                (p.total > 0 ? ' / ' + fmtBytes(p.total) : '');
+    showProgress(label, p.total > 0 ? Math.round((p.received / p.total) * 100) : null);
+  };
+
+  // native -> JS: render the full settings snapshot.
+  window.inklineSetState = function (state) {
+    document.getElementById('enabled').checked = !!state.enabled;
+    document.getElementById('suppressSecure').checked = !!state.suppressSecure;
+    var box = document.getElementById('apps');
+    box.innerHTML = '';
+    if (!state.apps || state.apps.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No apps found.';
+      box.appendChild(empty);
+      return;
+    }
+    state.apps.forEach(function (app) {
+      var row = document.createElement('div');
+      row.className = 'app';
+      var name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = app.name;
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = app.enabled;
+      cb.addEventListener('change', function (e) {
+        send({ type: 'setAppEnabled', bundleId: app.bundleId, value: e.target.checked });
+      });
+      row.appendChild(name);
+      row.appendChild(cb);
+      box.appendChild(row);
+    });
+  };
+
+  send({ type: 'ready' });
+</script>
+</body>
+</html>
