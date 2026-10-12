@@ -1,6 +1,6 @@
 # Inkline
 
-System-wide, **on-device** predictive-text autocomplete for macOS.
+System-wide, **on-device** predictive-text autocomplete for macOS
 
 As you type in any app, Inkline predicts the rest of your sentence and shows it
 as gray "ghost text" at the caret. Press <kbd>Tab</kbd> to accept it word by
